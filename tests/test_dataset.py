@@ -66,6 +66,34 @@ class FilteringSceneTest(unittest.TestCase):
         self.assertEqual([images[x]['scene'] for x in images],['A','B','(unmatched)'])
 
 
+class GTStatusTest(unittest.TestCase):
+    def test_uncertain_gt_is_not_absence_and_is_exported(self):
+        from seg_dataset_lab import gt_status, filter_images, objects_in_images
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp); root=base/'images'; root.mkdir(); gt=base/'gt'; gt.mkdir()
+            for name in ('valid','invalid','duplicate','missing','orphan','no_category'):
+                Image.new('RGB',(20,10)).save(root/f'{name}.png')
+            def write(name, image, annotations, **extra):
+                (gt/name).write_text(json.dumps({'images':[{'id':1,'file_name':image+'.png','width':20,'height':10}], 'annotations':annotations, **extra}))
+            write('a.json','valid',[])
+            write('b.json','invalid',[{'image_id':1,'bbox':[0,0,float('nan'),1]}])
+            write('c.json','duplicate',[])
+            write('d.json','duplicate',[{'image_id':1,'category_id':1,'bbox':[0,0,2,2]}])
+            write('e.json','orphan',[{'image_id':99,'category_id':1,'bbox':[0,0,2,2]}])
+            write('f.json','no_category',[{'image_id':1,'bbox':[0,0,2,2]}])
+            ds=Dataset(root,gt,{},[])
+            self.assertEqual({name:gt_status(ds.images[name+'.png']) for name in ('valid','invalid','duplicate','missing','orphan','no_category')},
+                {'valid':'valid','invalid':'invalid','duplicate':'duplicate','missing':'missing','orphan':'invalid','no_category':'invalid'})
+            self.assertEqual(filter_images(ds,'1','All','All','All',[8,16,32],'Without category'),['valid.png'])
+            paths=list(ds.images); out=base/'report'
+            export_report(ds,out,'1',objects_in_images(ds,paths,'1'),image_paths=paths)
+            with (out/'images.csv').open(encoding='utf-8-sig',newline='') as f: rows={r['image']:r for r in csv.DictReader(f)}
+            self.assertEqual(len(rows),6)
+            self.assertEqual(len(json.loads(rows['duplicate.png']['gt_sources'])),2)
+            self.assertEqual(rows['invalid.png']['gt_status'],'invalid')
+            self.assertIn('valid gt without target: 1', (out/'report.html').read_text(encoding='utf-8').lower())
+
+
 class MatchModesTest(unittest.TestCase):
     def test_any_all_mode_tie_and_missing(self):
         from seg_dataset_lab import match_details
@@ -109,3 +137,131 @@ class PreviewTest(unittest.TestCase):
         self.assertIs(hit_mask([big,small],{id(big):m1,id(small):m2},2,2),big)
         self.assertEqual(sorted([big,small],key=lambda o:object_sort_key(o,'size',{})),[small,big])
         self.assertEqual(sorted([big,small],key=lambda o:object_sort_key(o,'area',{})),[small,big])
+
+
+class BrightnessTest(unittest.TestCase):
+    def test_signed_difference_exclusions_and_sample_limits(self):
+        import numpy as np
+        from seg_dataset_lab import measure_brightness
+
+        target = np.zeros((40, 40), dtype=bool)
+        target[:6, :6] = True
+        excluded = np.zeros_like(target)
+        excluded[:18, 6:18] = True
+        y = np.full(target.shape, 100.0)
+        y[excluded] = 255
+        y[target] = 60
+        result = measure_brightness(y, target, excluded)
+        self.assertEqual(result['delta_y'], 40)
+        self.assertEqual(result['object_pixels'], 36)
+        self.assertEqual(result['background_pixels'], 72)
+        y[target] = 140
+        self.assertEqual(measure_brightness(y, target, excluded)['delta_y'], -40)
+        self.assertEqual(measure_brightness(y, target, ~target)['brightness_status'], 'insufficient_background_pixels')
+        target[1:, :] = False
+        self.assertEqual(measure_brightness(y, target, excluded)['brightness_status'], 'insufficient_object_pixels')
+        y[~target & ~excluded] = 100
+        adjusted = measure_brightness(y, target, excluded, settings=(2, 6, 1))
+        self.assertEqual(adjusted['delta_y'], -40)
+
+    def test_dataset_measurement_exports_signed_difference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / 'images'
+            root.mkdir()
+            image = Image.new('RGB', (40, 40), (100, 100, 100))
+            image.paste((60, 60, 60), (10, 10, 16, 16))
+            image.save(root / 'boat.png')
+            gt = base / 'gt.json'
+            gt.write_text(json.dumps({
+                'images': [{'id': 1, 'file_name': 'boat.png', 'width': 40, 'height': 40}],
+                'annotations': [
+                    {'id': 1, 'image_id': 1, 'category_id': 1, 'bbox': [10, 10, 6, 6],
+                     'segmentation': [[10, 10, 15, 10, 15, 15, 10, 15]]},
+                    {'id': 2, 'image_id': 1, 'category_id': 1, 'bbox': [29, 29, 5, 5]},
+                ],
+            }), encoding='utf-8')
+            from seg_dataset_lab import assign_scenes
+            ds = Dataset(root, gt, {}, [r'^other'], work=(40, 40))
+            assign_scenes(ds.images, [('Harbor', r'^boat')])
+            ds.analyze_brightness((10, 32, 64))
+            out = base / 'report'
+            export_report(ds, out, '1', ds.objects, image_paths=['boat.png'])
+            with (out / 'objects.csv').open(encoding='utf-8-sig', newline='') as handle:
+                measured, unknown = csv.DictReader(handle)
+            self.assertEqual(measured['brightness_status'], 'measured')
+            self.assertAlmostEqual(float(measured['delta_y']), 40)
+            self.assertEqual(unknown['brightness_status'], 'mask_unavailable')
+            self.assertEqual(unknown['delta_y'], '')
+            with (out / 'images.csv').open(encoding='utf-8-sig', newline='') as handle:
+                row, = csv.DictReader(handle)
+            self.assertEqual(row['regex_status'], 'Scene rule matched')
+            self.assertEqual(row['grouping_rule_hits'], '[]')
+            self.assertEqual(row['measured_objects'], '1')
+            report = (out / 'report.html').read_text(encoding='utf-8')
+            self.assertIn('Ring radius 10 px', report)
+            self.assertIn('<td>Median |ΔY|</td><td>40.0</td>', report)
+            self.assertIn('Absolute |ΔY| histogram', report)
+            self.assertIn('Valid GT with target: 1', report)
+            self.assertIn('Scene rule matched', report)
+            self.assertIn((root / 'boat.png').as_uri(), report)
+            self.assertNotIn('regex unmatched', report)
+
+    def test_delta_filter_combines_size_category_and_brightness_on_one_object(self):
+        from seg_dataset_lab import filter_images
+        from types import SimpleNamespace
+
+        def item(*objects):
+            return {'annotations': objects}
+
+        def obj(diagonal, delta, category_id=1):
+            return {'category_id': category_id, 'diagonal': diagonal, 'delta_y': delta}
+
+        ds = SimpleNamespace(images={
+            'mixed': item(obj(4, 40), obj(12, -15)),
+            'negative': item(obj(4, -15)),
+            'positive': item(obj(4, 15)),
+            'zero': item(obj(4, 0)),
+            'unknown': item(obj(4, None)),
+            'different': item(obj(4, -15, 2)),
+        })
+        for kind, lower, upper, expected in [
+            ('Negative', -15, 0, ['negative']),
+            ('Positive', 0, 15, ['positive']),
+            ('Absolute', 0, 15, ['negative','positive','zero']),
+            ('Signed', -15, 15, ['negative','positive','zero']),
+        ]:
+            with self.subTest(kind=kind):
+                self.assertEqual(filter_images(ds,'1','<8','All','All',(8,16,32),
+                                               brightness=(kind,lower,upper)), expected)
+
+
+class ObjectRowFilterTest(unittest.TestCase):
+    def test_populate_objects_uses_active_category_bin_and_mode(self):
+        from types import SimpleNamespace
+        from seg_dataset_lab import App, SPECIAL_BIN, objects_in_images
+        class Var:
+            def __init__(self, value): self.value=value
+            def get(self): return self.value
+        class Tree:
+            def __init__(self): self.rows=[]
+            def get_children(self): return []
+            def delete(self, *args): self.rows=[]
+            def insert(self, *args, **kwargs): self.rows.append(kwargs)
+            def tag_configure(self, *args, **kwargs): pass
+        def obj(ident, category, diagonal, height):
+            return {'id':ident,'image':'a','category_id':category,'diagonal':diagonal,'height':height,'width':2,'area':4}
+        objects=[obj('a',1,7,2),obj('b',1,10,2),obj('c',1,10,5),obj('d',2,10,2)]
+        ds=SimpleNamespace(images={'a':{'annotations':objects}}, categories={1:'one',2:'two'})
+        app=SimpleNamespace(object_tree=Tree(),current_image='a',current=None,ds=ds,gt_sort_column='size',gt_sort_desc=False,edges=[5,9,20],vars={k:Var(v) for k,v in {'category':'1','bin':'9–<20','mode':'Any'}.items()})
+        def tags():
+            App.populate_objects(app)
+            return {r['values'][0]:r['tags'][0] for r in app.object_tree.rows}
+        self.assertEqual(tags(),{'a':'other','b':'match','c':'match','d':'other'})
+        app.vars['bin'].value=SPECIAL_BIN
+        self.assertEqual(tags(),{'a':'other','b':'match','c':'other','d':'other'})
+        app.vars['category'].value='All'
+        self.assertEqual(tags(),{'a':'other','b':'match','c':'other','d':'match'})
+        app.vars['category'].value='2'; app.vars['mode'].value='Without category'
+        self.assertEqual(tags(),{'a':'other','b':'other','c':'other','d':'match'})
+        self.assertEqual(len(objects_in_images(ds,['a'],'1')),3)
