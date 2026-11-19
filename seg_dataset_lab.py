@@ -261,6 +261,27 @@ def export_report(ds, out, category, objects, edges=(8,16,32), copy_images=False
     image_text=f'Copied {len(copied)} selected images.<ul>{links}</ul>' if copy_images else 'No images copied. Object paths are relative to the original dataset root.'
     (out/'report.html').write_text(f'''<!doctype html><meta charset="utf-8"><title>Dataset report</title><style>body{{font:15px sans-serif;margin:2em}}td,th{{border:1px solid #bbb;padding:.35em;text-align:left}}table{{border-collapse:collapse}}</style><h1>Segmentation dataset report</h1><p>Image filters: {context_text}</p><p>Selected images: {len(image_paths)}; GT present: {gt}; target present: {len(has)}; annotated without target: {gt-len(has)}; missing GT: {len(image_paths)-gt}.</p><p>Category: {esc(category)}; selected objects: {len(objects)}; working grid: {ds.work[0]}×{ds.work[1]}, direct scaling; diagonal bin edges: {esc(edges)} px. Object and image denominators: {len(objects)}, {len(image_paths)}.</p><p>{image_text}</p><h2>Scene and size</h2><table><tr><th>Scene</th><th>Bin</th><th>Objects</th><th>Images</th></tr>{rows}</table><h2>Issues ({len(ds.issues)})</h2><table><tr><th>Type</th><th>Detail</th></tr>{issues}</table><p>Object IDs and complete measurements: objects.csv</p>''',encoding='utf-8')
 
+def object_sort_key(obj, column, categories):
+    if column == 'id': return str(obj['id']).casefold()
+    if column == 'class': return str(categories.get(obj['category_id'], obj['category_id'])).casefold()
+    if column == 'size': return obj['diagonal']
+    if column == 'area': return obj['area'] if obj['area'] is not None else -1
+    raise ValueError(f'Unknown object column: {column}')
+
+
+def preview_to_work(x, y, canvas_size, display_size, offset, work_size):
+    cw,ch=canvas_size; dw,dh=display_size
+    left=cw/2+offset[0]-dw/2; top=ch/2+offset[1]-dh/2
+    if not (left <= x < left+dw and top <= y < top+dh): return None
+    return min(work_size[0]-1,int((x-left)*work_size[0]/dw)), min(work_size[1]-1,int((y-top)*work_size[1]/dh))
+
+
+def hit_mask(objects, masks, x, y):
+    hits=[(int(mask.sum()), index, obj) for index,obj in enumerate(objects)
+          if (mask := masks.get(id(obj))) is not None and mask[y,x]]
+    return min(hits, key=lambda entry:(entry[0],entry[1]))[2] if hits else None
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -270,6 +291,7 @@ class App(tk.Tk):
         self.zoom=1.; self.offset=[0,0]; self.drag=None; self.events=queue.Queue(); self.scanning=False
         self.edges=[8.,16.,32.]; self.chart=None; self.chart_bars=[]
         self.scene_rules=[]; self.sort_column='image'; self.sort_desc=False
+        self.gt_sort_column='id'; self.gt_sort_desc=False; self.mask_cache={}; self.preview_size=None; self.drag_start=None; self.dragged=False
         self.vars={k:tk.StringVar(value=v) for k,v in {'root':'','gt':'','train':'','val':'','test':'','regex':r'^(?P<scene>.+?)_(?P<camera>camera\d+)_frame_(?P<frame>\d+)','target':'name','width':'960','height':'768','category':'1','bin':'All','scene':'All','split':'All','lookup':'','edges':'8,16,32','mode':'Any'}.items()}
         top=ttk.Frame(self,padding=5); top.pack(fill='x')
         for r,(key,label,isdir) in enumerate([('root','Images folder',True),('gt','GT JSON / folder',False),('train','Train index',False),('val','Val index',False),('test','Test index',False)]):
@@ -286,9 +308,9 @@ class App(tk.Tk):
         for k,vals in [('category',['All']),('bin',['All',*BINS,'8–<16 and height <4']),('mode',['Any','All','Mode','Without category']),('scene',['All']),('split',['All','train','val','test','unassigned'])]:
             ttk.Label(filters,text=k.title()).pack(side='left'); c=ttk.Combobox(filters,textvariable=self.vars[k],values=vals,width=13,state='readonly'); c.pack(side='left'); c.bind('<<ComboboxSelected>>',lambda e:self.refresh()); self.boxes[k]=c
         ttk.Label(filters,text='Object ID').pack(side='left'); ttk.Entry(filters,textvariable=self.vars['lookup'],width=17).pack(side='left'); ttk.Button(filters,text='Find',command=self.find).pack(side='left')
-        body=ttk.Panedwindow(self,orient='horizontal'); body.pack(fill='both',expand=True)
-        left=ttk.Panedwindow(body,orient='horizontal'); right=ttk.Frame(body); body.add(left,weight=3); body.add(right,weight=3)
-        images=ttk.Frame(left); objects=ttk.Frame(left); left.add(images,weight=1); left.add(objects,weight=1)
+        body=tk.PanedWindow(self,orient='horizontal',sashwidth=9,sashrelief='raised',showhandle=True); body.pack(fill='both',expand=True)
+        images=ttk.Frame(body); objects=ttk.Frame(body); right=ttk.Frame(body)
+        body.add(images,minsize=100,width=420); body.add(objects,minsize=100,width=340); body.add(right,minsize=160)
         ttk.Label(images,text='Images (select to view)',font=('TkDefaultFont',10,'bold')).pack(anchor='w')
         self.image_tree=self.make_tree(images,[('image',200),('scene',75),('split',75),('GT',65),('match',75)])
         self.image_tree.bind('<<TreeviewSelect>>',self.select_image)
@@ -296,10 +318,11 @@ class App(tk.Tk):
         ttk.Label(objects,text='GT objects in selected image',font=('TkDefaultFont',10,'bold')).pack(anchor='w')
         self.object_tree=self.make_tree(objects,[('id',105),('class',65),('size',125),('area',60)])
         self.object_tree.bind('<<TreeviewSelect>>',self.select_object)
-        opts=ttk.Frame(right); opts.pack(fill='x'); self.showbox=tk.BooleanVar(value=True); self.showmask=tk.BooleanVar(value=True)
-        for label,var in [('BBox',self.showbox),('GT overlay',self.showmask)]: ttk.Checkbutton(opts,text=label,variable=var,command=self.render).pack(side='left')
-        ttk.Label(opts,text='Mouse wheel: zoom; drag: pan').pack(side='left')
-        self.canvas=tk.Canvas(right,bg='#252525'); self.canvas.pack(fill='both',expand=True); self.canvas.bind('<Configure>',lambda e:self.render()); self.canvas.bind('<MouseWheel>',self.wheel); self.canvas.bind('<Button-4>',lambda e:self.wheel(e,1)); self.canvas.bind('<Button-5>',lambda e:self.wheel(e,-1)); self.canvas.bind('<ButtonPress-1>',self.press); self.canvas.bind('<B1-Motion>',self.pan)
+        for col in ('id','class','size','area'): self.object_tree.heading(col,command=lambda c=col:self.sort_objects(c))
+        opts=ttk.Frame(right); opts.pack(fill='x'); self.showbox=tk.BooleanVar(value=True); self.showmask=tk.BooleanVar(value=True); self.showall=tk.BooleanVar(value=True)
+        for label,var in [('BBox',self.showbox),('GT overlay',self.showmask),('All masks',self.showall)]: ttk.Checkbutton(opts,text=label,variable=var,command=self.render).pack(side='left')
+        ttk.Label(opts,text='Click mask to select; wheel: zoom; drag: pan').pack(side='left')
+        self.canvas=tk.Canvas(right,bg='#252525'); self.canvas.pack(fill='both',expand=True); self.canvas.bind('<Configure>',lambda e:self.render()); self.canvas.bind('<MouseWheel>',self.wheel); self.canvas.bind('<Button-4>',lambda e:self.wheel(e,1)); self.canvas.bind('<Button-5>',lambda e:self.wheel(e,-1)); self.canvas.bind('<ButtonPress-1>',self.press); self.canvas.bind('<B1-Motion>',self.pan); self.canvas.bind('<ButtonRelease-1>',self.release)
         bottom=ttk.Frame(self); bottom.pack(fill='x')
         self.status=tk.StringVar(value='Select dataset and GT, then Scan.'); ttk.Label(bottom,textvariable=self.status,anchor='w').pack(side='left',fill='x',expand=True)
         self.progress=ttk.Progressbar(bottom,length=220,mode='determinate'); self.progress.pack(side='right',padx=5)
@@ -353,7 +376,7 @@ class App(tk.Tk):
         except queue.Empty:pass
         self.after(80,self.poll_events)
     def loaded(self,ds):
-        self.ds=ds; self.current=None; self.current_image=None; self.canvas.delete('all')
+        self.ds=ds; self.current=None; self.current_image=None; self.mask_cache={}; self.canvas.delete('all')
         self.boxes['category']['values']=['All']+[str(x) for x in sorted(ds.categories)]
         self.apply_scene_rules()
 
@@ -436,16 +459,24 @@ class App(tk.Tk):
         if not selected:return
         rel=self.image_rows[int(selected[0])]
         if rel==self.current_image: return
-        self.current_image=rel; self.current=None; self.zoom=1.; self.offset=[0,0]; self.populate_objects(); self.render()
+        self.current_image=rel; self.current=None; self.mask_cache={}; self.zoom=1.; self.offset=[0,0]; self.populate_objects(); self.render()
+    def sort_objects(self, column):
+        if self.gt_sort_column == column:self.gt_sort_desc=not self.gt_sort_desc
+        else:self.gt_sort_column=column; self.gt_sort_desc=False
+        self.populate_objects()
+
     def populate_objects(self):
         self.object_tree.delete(*self.object_tree.get_children())
         if not self.current_image:return
         matching={o['id'] for o in self.rows if o['image']==self.current_image}
-        self.object_rows=list(self.ds.images[self.current_image]['annotations'])
+        self.object_rows=sorted(self.ds.images[self.current_image]['annotations'],key=lambda o:object_sort_key(o,self.gt_sort_column,self.ds.categories),reverse=self.gt_sort_desc)
         for n,o in enumerate(self.object_rows):
             cls=self.ds.categories.get(o['category_id'],str(o['category_id'])); tag='match' if o['id'] in matching else 'other'
             self.object_tree.insert('','end',iid=str(n),values=(o['id'],cls,f'{o["width"]:.1f}×{o["height"]:.1f} / {o["diagonal"]:.1f}',o['area'] if o['area'] is not None else '—'),tags=(tag,))
         self.object_tree.tag_configure('other',foreground='#888888')
+        if self.current is not None:
+            for n,obj in enumerate(self.object_rows):
+                if obj is self.current:self.object_tree.selection_set(str(n)); self.object_tree.see(str(n)); break
     def select_object(self,event=None):
         selected=self.object_tree.selection()
         if not selected:return
@@ -456,29 +487,62 @@ class App(tk.Tk):
                 n=self.image_rows.index(o['image']); self.image_tree.selection_set(str(n)); self.image_tree.see(str(n)); self.select_image()
                 m=next(i for i,x in enumerate(self.object_rows) if x['id']==o['id']); self.object_tree.selection_set(str(m)); self.object_tree.see(str(m)); self.select_object(); return
         messagebox.showinfo('Find','Object ID not found in current filters.')
+    def work_mask(self, obj):
+        key=id(obj)
+        if key not in self.mask_cache:
+            try:
+                mask=mask_for(obj['segmentation'],*obj['gt_size'])
+                self.mask_cache[key]=np.asarray(mask.resize(self.ds.work,Image.Resampling.NEAREST),dtype=bool) if mask is not None else None
+            except Exception as exc:
+                self.mask_cache[key]=None
+                self.status.set(f'Mask unavailable for {obj["id"]}: {exc}')
+        return self.mask_cache[key]
+
     def render(self):
         if not self.ds or not self.current_image:return
         o=self.current; item=self.ds.images[self.current_image]
         try:
             with Image.open(item['path']) as source: im=source.convert('RGB').resize(self.ds.work,Image.Resampling.BILINEAR)
-            if o and self.showmask.get():
-                m=mask_for(o['segmentation'],*o['gt_size'])
-                if m is not None:
-                    m=m.resize(self.ds.work,Image.Resampling.NEAREST); overlay=Image.new('RGB',self.ds.work,(255,30,30)); im=Image.composite(Image.blend(im,overlay,.45),im,m)
+            if self.showmask.get():
+                objects=item['annotations'] if self.showall.get() else ([o] if o else [])
+                entries=[(obj,self.work_mask(obj)) for obj in objects]
+                entries=[(obj,mask) for obj,mask in entries if mask is not None and mask.any()]
+                entries.sort(key=lambda entry:(entry[0] is o, -int(entry[1].sum())))
+                for obj,mask in entries:
+                    digest=hashlib.sha256(str(obj['category_id']).encode()).digest()
+                    color=(255,220,20) if obj is o else tuple(70+v%165 for v in digest[:3])
+                    overlay=Image.new('RGB',self.ds.work,color)
+                    im=Image.composite(Image.blend(im,overlay,.42),im,Image.fromarray(mask))
             if o and self.showbox.get():
                 x,y,w,h=o['bbox']; sx=self.ds.work[0]/o['gt_size'][0]; sy=self.ds.work[1]/o['gt_size'][1]
                 ImageDraw.Draw(im).rectangle((x*sx,y*sy,(x+w)*sx,(y+h)*sy),outline='yellow',width=1)
             cw=max(self.canvas.winfo_width(),1); ch=max(self.canvas.winfo_height(),1); scale=min(cw/im.width,ch/im.height)*self.zoom
-            im=im.resize((max(1,int(im.width*scale)),max(1,int(im.height*scale))),Image.Resampling.NEAREST if scale>=1 else Image.Resampling.BILINEAR)
+            self.preview_size=(max(1,int(im.width*scale)),max(1,int(im.height*scale)))
+            im=im.resize(self.preview_size,Image.Resampling.NEAREST if scale>=1 else Image.Resampling.BILINEAR)
             self.photo=ImageTk.PhotoImage(im); self.canvas.delete('all'); self.canvas.create_image(cw/2+self.offset[0],ch/2+self.offset[1],image=self.photo)
-            label=f'ID {o["id"]}  GT {o["gt_size"]} → work {self.ds.work}  mask area {o["area"]}' if o else f'{self.current_image} — select a GT object to overlay'
+            label=f'ID {o["id"]}  GT {o["gt_size"]} → work {self.ds.work}  mask area {o["area"]}' if o else f'{self.current_image} — click a mask or select a GT row'
             self.canvas.create_text(8,8,anchor='nw',fill='white',text=label)
         except Exception as e:self.status.set(f'Preview error: {e}')
     def wheel(self,e,direction=None):
         self.zoom=max(.2,min(30,self.zoom*(1.25 if (direction or e.delta)>0 else .8))); self.render()
-    def press(self,e):self.drag=(e.x,e.y)
+    def press(self,e):self.drag=(e.x,e.y); self.drag_start=(e.x,e.y); self.dragged=False
     def pan(self,e):
-        if self.drag:self.offset[0]+=e.x-self.drag[0]; self.offset[1]+=e.y-self.drag[1]; self.drag=(e.x,e.y); self.render()
+        if self.drag:
+            if self.drag_start and math.hypot(e.x-self.drag_start[0],e.y-self.drag_start[1])>3:self.dragged=True
+            if self.dragged:self.offset[0]+=e.x-self.drag[0]; self.offset[1]+=e.y-self.drag[1]; self.render()
+            self.drag=(e.x,e.y)
+    def release(self,e):
+        if self.dragged or not self.current_image or not self.showmask.get() or not self.preview_size:
+            self.drag=None; return
+        point=preview_to_work(e.x,e.y,(self.canvas.winfo_width(),self.canvas.winfo_height()),self.preview_size,self.offset,self.ds.work)
+        if point is not None:
+            objects=self.ds.images[self.current_image]['annotations'] if self.showall.get() else ([self.current] if self.current else [])
+            masks={id(obj):self.work_mask(obj) for obj in objects}
+            hit=hit_mask(objects,masks,*point)
+            if hit is not None:
+                index=next(n for n,obj in enumerate(self.object_rows) if obj is hit)
+                self.object_tree.selection_set(str(index)); self.object_tree.see(str(index)); self.select_object()
+        self.drag=None
     def apply_edges(self):
         try:edges=parse_edges(self.vars['edges'].get())
         except ValueError as e:messagebox.showerror('Invalid bins',str(e),parent=self.chart or self); return
@@ -538,5 +602,6 @@ class App(tk.Tk):
         ttk.Button(dialog,text='Choose output folder and export',command=go).pack(pady=8)
 
 if __name__=='__main__': App().mainloop()
+
 
 
