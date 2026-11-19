@@ -153,7 +153,56 @@ class Dataset:
                     obj['bin']=size_bin(obj['diagonal']); self.objects.append(obj); item['annotations'].append(obj)
                 except (KeyError, TypeError, ValueError) as e: self.issues.append(('invalid annotation', f'{rel}: {e}'))
 
-def export_report(ds, out, category, objects, edges=(8,16,32), copy_images=False):
+def alpha_name(index):
+    result = ''
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def assign_scenes(images, rules, target='name'):
+    """Assign first matching rule and retain all matches for review."""
+    compiled = [(name.strip() or alpha_name(n), re.compile(pattern))
+                for n, (name, pattern) in enumerate(rules)]
+    if not compiled:
+        values = sorted({i['groups'].get('scene') for i in images.values() if i['groups'].get('scene')})
+        inferred = {value: alpha_name(n) for n, value in enumerate(values)}
+    for rel, item in images.items():
+        if compiled:
+            subject = Path(rel).name if target == 'name' else rel
+            matches = [(n + 1, name) for n, (name, regex) in enumerate(compiled) if regex.search(subject)]
+            item['scene'] = matches[0][1] if matches else '(unmatched)'
+            item['scene_matches'] = matches
+        else:
+            raw = item['groups'].get('scene')
+            item['scene'] = inferred.get(raw, '(unmatched)')
+            item['scene_matches'] = []
+
+
+def filter_images(ds, category, bin_name, scene, split, edges):
+    selected = []
+    for rel, item in ds.images.items():
+        if scene != 'All' and item.get('scene', '(unmatched)') != scene: continue
+        if split != 'All' and item['split'] != split: continue
+        if category == 'All' and bin_name == 'All':
+            selected.append(rel); continue
+        def matches(o):
+            if category != 'All' and str(o['category_id']) != str(category): return False
+            if bin_name == '8–<16 and height <4': return 8 <= o['diagonal'] < 16 and o['height'] < 4
+            return bin_name == 'All' or size_bin(o['diagonal'], edges) == bin_name
+        if any(matches(o) for o in item['annotations']): selected.append(rel)
+    return selected
+
+
+def objects_in_images(ds, image_paths, category):
+    return [o for rel in image_paths for o in ds.images[rel]['annotations']
+            if category == 'All' or str(o['category_id']) == str(category)]
+
+
+def export_report(ds, out, category, objects, edges=(8,16,32), copy_images=False, image_paths=None):
+    image_paths = list({o['image'] for o in objects} if image_paths is None else image_paths)
     out = Path(out).resolve()
     if out == ds.root or ds.root in out.parents:
         raise ValueError('Choose a report folder outside the image dataset root to protect source files.')
@@ -162,28 +211,28 @@ def export_report(ds, out, category, objects, edges=(8,16,32), copy_images=False
     with (out/'objects.csv').open('w',newline='',encoding='utf-8-sig') as f:
         writer=csv.DictWriter(f,fieldnames=fields); writer.writeheader()
         for o in objects:
-            row={k:o.get(k) for k in fields}; row.update(split=ds.images[o['image']]['split'],groups=json.dumps(ds.images[o['image']]['groups'],ensure_ascii=False),work_size=ds.work,bin=size_bin(o['diagonal'],edges)); writer.writerow(row)
+            row={k:o.get(k) for k in fields}; row.update(split=ds.images[o['image']]['split'],groups=json.dumps({**ds.images[o['image']]['groups'], 'scene':ds.images[o['image']].get('scene','(unmatched)')},ensure_ascii=False),work_size=ds.work,bin=size_bin(o['diagonal'],edges)); writer.writerow(row)
     groups=defaultdict(list)
-    for o in objects: groups[(ds.images[o['image']]['groups'].get('scene') or '(ungrouped)',size_bin(o['diagonal'],edges))].append(o)
+    for o in objects: groups[(ds.images[o['image']].get('scene', '(unmatched)'),size_bin(o['diagonal'],edges))].append(o)
     with (out/'groups.csv').open('w',newline='',encoding='utf-8-sig') as f:
         w=csv.writer(f); w.writerow(['scene','bin','objects','images','object_denominator','image_denominator'])
-        for (scene,b), vals in sorted(groups.items()): w.writerow([scene,b,len(vals),len({v['image'] for v in vals}),len(objects),len(ds.images)])
+        for (scene,b), vals in sorted(groups.items()): w.writerow([scene,b,len(vals),len({v['image'] for v in vals}),len(objects),len(image_paths)])
     copied=[]
     if copy_images:
-        for rel in sorted({o['image'] for o in objects}):
+        for rel in sorted(image_paths):
             dest=out/'images'/rel
             dest.parent.mkdir(parents=True,exist_ok=True)
             if dest.resolve() == ds.images[rel]['path'].resolve(): raise ValueError('Report image would overwrite a source image.')
             shutil.copy2(ds.images[rel]['path'], dest)
             copied.append(rel)
-    has={o['image'] for o in ds.objects if str(o['category_id'])==str(category)}
-    gt=sum(i['gt'] for i in ds.images.values())
+    has={o['image'] for o in objects}
+    gt=sum(ds.images[rel]['gt'] for rel in image_paths)
     esc=lambda x:html.escape(str(x))
     rows=''.join(f'<tr><td>{esc(a)}</td><td>{esc(b)}</td><td>{len(v)}</td><td>{len({o["image"] for o in v})}</td></tr>' for (a,b),v in sorted(groups.items()))
     issues=''.join(f'<tr><td>{esc(a)}</td><td>{esc(b)}</td></tr>' for a,b in ds.issues)
     links=''.join(f'<li><a href="images/{quote(rel, safe="/")}">{esc(rel)}</a></li>' for rel in copied)
-    image_text=f'Copied {len(copied)} images used by selected objects.<ul>{links}</ul>' if copy_images else 'No images copied. Object paths are relative to the original dataset root.'
-    (out/'report.html').write_text(f'''<!doctype html><meta charset="utf-8"><title>Dataset report</title><style>body{{font:15px sans-serif;margin:2em}}td,th{{border:1px solid #bbb;padding:.35em;text-align:left}}table{{border-collapse:collapse}}</style><h1>Segmentation dataset report</h1><p>Images: {len(ds.images)}; GT present: {gt}; target present: {len(has)}; annotated without target: {gt-len(has)}; missing GT: {len(ds.images)-gt}.</p><p>Category: {esc(category)}; selected objects: {len(objects)}; working grid: {ds.work[0]}×{ds.work[1]}, direct scaling; diagonal bin edges: {esc(edges)} px. Object and image denominators: {len(objects)}, {len(ds.images)}.</p><p>{image_text}</p><h2>Scene and size</h2><table><tr><th>Scene</th><th>Bin</th><th>Objects</th><th>Images</th></tr>{rows}</table><h2>Issues ({len(ds.issues)})</h2><table><tr><th>Type</th><th>Detail</th></tr>{issues}</table><p>Object IDs and complete measurements: objects.csv</p>''',encoding='utf-8')
+    image_text=f'Copied {len(copied)} selected images.<ul>{links}</ul>' if copy_images else 'No images copied. Object paths are relative to the original dataset root.'
+    (out/'report.html').write_text(f'''<!doctype html><meta charset="utf-8"><title>Dataset report</title><style>body{{font:15px sans-serif;margin:2em}}td,th{{border:1px solid #bbb;padding:.35em;text-align:left}}table{{border-collapse:collapse}}</style><h1>Segmentation dataset report</h1><p>Selected images: {len(image_paths)}; GT present: {gt}; target present: {len(has)}; annotated without target: {gt-len(has)}; missing GT: {len(image_paths)-gt}.</p><p>Category: {esc(category)}; selected objects: {len(objects)}; working grid: {ds.work[0]}×{ds.work[1]}, direct scaling; diagonal bin edges: {esc(edges)} px. Object and image denominators: {len(objects)}, {len(image_paths)}.</p><p>{image_text}</p><h2>Scene and size</h2><table><tr><th>Scene</th><th>Bin</th><th>Objects</th><th>Images</th></tr>{rows}</table><h2>Issues ({len(ds.issues)})</h2><table><tr><th>Type</th><th>Detail</th></tr>{issues}</table><p>Object IDs and complete measurements: objects.csv</p>''',encoding='utf-8')
 
 class App(tk.Tk):
     def __init__(self):
@@ -193,6 +242,7 @@ class App(tk.Tk):
         self.current_image=None; self.current=None; self.photo=None
         self.zoom=1.; self.offset=[0,0]; self.drag=None; self.events=queue.Queue(); self.scanning=False
         self.edges=[8.,16.,32.]; self.chart=None; self.chart_bars=[]
+        self.scene_rules=[]; self.sort_column='image'; self.sort_desc=False
         self.vars={k:tk.StringVar(value=v) for k,v in {'root':'','gt':'','train':'','val':'','test':'','regex':r'^(?P<scene>.+?)_(?P<camera>camera\d+)_frame_(?P<frame>\d+)','target':'name','width':'960','height':'768','category':'1','bin':'All','scene':'All','split':'All','lookup':'','edges':'8,16,32'}.items()}
         top=ttk.Frame(self,padding=5); top.pack(fill='x')
         for r,(key,label,isdir) in enumerate([('root','Images folder',True),('gt','GT JSON / folder',False),('train','Train index',False),('val','Val index',False),('test','Test index',False)]):
@@ -204,17 +254,18 @@ class App(tk.Tk):
         ttk.Combobox(rules,textvariable=self.vars['target'],values=['name','path'],width=6,state='readonly').pack(side='left')
         for k in ('width','height'): ttk.Entry(rules,textvariable=self.vars[k],width=5).pack(side='left')
         self.scan_button=ttk.Button(rules,text='Scan',command=self.scan); self.scan_button.pack(side='left')
-        for title,cmd in [('Save project',self.save),('Open project',self.open),('Statistics',self.show_chart),('Export report',self.export)]: ttk.Button(rules,text=title,command=cmd).pack(side='left')
+        for title,cmd in [('Save project',self.save),('Open project',self.open),('Scenes',self.scene_editor),('Statistics',self.show_chart),('Export report',self.export)]: ttk.Button(rules,text=title,command=cmd).pack(side='left')
         filters=ttk.Frame(self,padding=5); filters.pack(fill='x'); self.boxes={}
-        for k,vals in [('category',[]),('bin',['All',*BINS,'8–<16 and height <4']),('scene',['All']),('split',['All','train','val','test','unassigned'])]:
+        for k,vals in [('category',['All']),('bin',['All',*BINS,'8–<16 and height <4']),('scene',['All']),('split',['All','train','val','test','unassigned'])]:
             ttk.Label(filters,text=k.title()).pack(side='left'); c=ttk.Combobox(filters,textvariable=self.vars[k],values=vals,width=13,state='readonly'); c.pack(side='left'); c.bind('<<ComboboxSelected>>',lambda e:self.refresh()); self.boxes[k]=c
         ttk.Label(filters,text='Object ID').pack(side='left'); ttk.Entry(filters,textvariable=self.vars['lookup'],width=17).pack(side='left'); ttk.Button(filters,text='Find',command=self.find).pack(side='left')
         body=ttk.Panedwindow(self,orient='horizontal'); body.pack(fill='both',expand=True)
         left=ttk.Panedwindow(body,orient='horizontal'); right=ttk.Frame(body); body.add(left,weight=3); body.add(right,weight=3)
         images=ttk.Frame(left); objects=ttk.Frame(left); left.add(images,weight=1); left.add(objects,weight=1)
         ttk.Label(images,text='Images (select to view)',font=('TkDefaultFont',10,'bold')).pack(anchor='w')
-        self.image_tree=self.make_tree(images,[('image',200),('split',65),('GT',65)])
+        self.image_tree=self.make_tree(images,[('image',200),('scene',75),('split',75),('GT',65)])
         self.image_tree.bind('<<TreeviewSelect>>',self.select_image)
+        for col in ('image','scene','split','GT'): self.image_tree.heading(col,command=lambda c=col:self.sort_images(c))
         ttk.Label(objects,text='GT objects in selected image',font=('TkDefaultFont',10,'bold')).pack(anchor='w')
         self.object_tree=self.make_tree(objects,[('id',105),('class',65),('size',125),('area',60)])
         self.object_tree.bind('<<TreeviewSelect>>',self.select_object)
@@ -276,45 +327,80 @@ class App(tk.Tk):
         self.after(80,self.poll_events)
     def loaded(self,ds):
         self.ds=ds; self.current=None; self.current_image=None; self.canvas.delete('all')
-        self.boxes['category']['values']=[str(x) for x in sorted(ds.categories)]
-        self.boxes['scene']['values']=['All']+sorted({i['groups'].get('scene','') for i in ds.images.values()}-{''})
+        self.boxes['category']['values']=['All']+[str(x) for x in sorted(ds.categories)]
+        self.apply_scene_rules()
+
+    def apply_scene_rules(self):
+        assign_scenes(self.ds.images,self.scene_rules,self.vars['target'].get())
+        scenes=sorted({i['scene'] for i in self.ds.images.values()})
+        self.boxes['scene']['values']=['All']+scenes
+        if self.vars['scene'].get() not in ['All']+scenes:self.vars['scene'].set('All')
         self.refresh()
+
     def filtered(self, ignore_bin=False):
         if not self.ds:return []
-        result=[]
-        for o in self.ds.objects:
-            i=self.ds.images[o['image']]; b=self.vars['bin'].get(); scene=self.vars['scene'].get(); split=self.vars['split'].get()
-            if str(o['category_id'])!=self.vars['category'].get():continue
-            if not ignore_bin:
-                if b=='8–<16 and height <4' and not (8<=o['diagonal']<16 and o['height']<4):continue
-                if b not in ('All','8–<16 and height <4') and size_bin(o['diagonal'],self.edges)!=b:continue
-            if scene!='All' and i['groups'].get('scene')!=scene:continue
-            if split!='All' and i['split']!=split:continue
-            result.append(o)
-        return result
+        return objects_in_images(self.ds,self.image_rows,self.vars['category'].get())
+
+    def sort_images(self, column):
+        if self.sort_column == column:self.sort_desc=not self.sort_desc
+        else:self.sort_column=column; self.sort_desc=False
+        self.refresh()
+
     def refresh(self):
         if not self.ds:return
-        self.rows=self.filtered(); by_image=defaultdict(list)
-        for o in self.rows:by_image[o['image']].append(o)
-        b=self.vars['bin'].get(); scene=self.vars['scene'].get(); split=self.vars['split'].get()
-        def image_ok(rel):
-            i=self.ds.images[rel]
-            if scene!='All' and i['groups'].get('scene')!=scene:return False
-            if split!='All' and i['split']!=split:return False
-            return b=='All' or rel in by_image
+        self.image_rows=filter_images(self.ds,self.vars['category'].get(),self.vars['bin'].get(),self.vars['scene'].get(),self.vars['split'].get(),self.edges)
         def sort_key(rel):
-            g=self.ds.images[rel]['groups']; f=g.get('frame') or ''
-            return (g.get('scene') or '',g.get('camera') or '',g.get('run') or '',g.get('segment') or '',int(f) if f.isdigit() else -1,rel)
-        self.image_rows=sorted((rel for rel in self.ds.images if image_ok(rel)),key=sort_key)
+            item=self.ds.images[rel]
+            keys={'image':rel.casefold(),'scene':item['scene'].casefold(),'split':item['split'].casefold(),'GT':len(item['annotations']) if item['gt'] else -1}
+            return keys[self.sort_column]
+        self.image_rows.sort(key=sort_key,reverse=self.sort_desc)
+        self.rows=self.filtered()
         self.image_tree.delete(*self.image_tree.get_children()); self.object_tree.delete(*self.object_tree.get_children()); self.object_rows=[]
         for n,rel in enumerate(self.image_rows):
             i=self.ds.images[rel]; state=f'{len(i["annotations"])} GT' if i['gt'] else 'missing'
-            self.image_tree.insert('','end',iid=str(n),values=(rel,i['split'],state))
+            self.image_tree.insert('','end',iid=str(n),values=(rel,i['scene'],i['split'],state))
         if self.current_image in self.image_rows:
             n=self.image_rows.index(self.current_image); self.image_tree.selection_set(str(n)); self.image_tree.see(str(n)); self.populate_objects()
         else:self.current_image=None; self.current=None; self.canvas.delete('all')
-        self.status.set(f'{len(self.ds.images):,} images | {sum(i["gt"] for i in self.ds.images.values()):,} with GT | {len(self.rows):,} matching objects in {len(by_image):,} images | {len(self.ds.issues):,} issues')
+        self.status.set(f'{len(self.image_rows):,} / {len(self.ds.images):,} images selected | {len(self.rows):,} category objects in selected images | {len(self.ds.issues):,} issues')
         self.draw_chart()
+    def scene_editor(self):
+        if not self.ds:messagebox.showinfo('Scenes','Scan a dataset first.'); return
+        dialog=tk.Toplevel(self); dialog.title('Scene rules'); dialog.geometry('980x650')
+        ttk.Label(dialog,text='One rule per line: Scene name | Python regex. Leave the name empty for A, B, C…; first match wins.',padding=6).pack(anchor='w')
+        ttk.Label(dialog,text='Rules use the name/path selector in the main window. With no rules, existing parsed scenes receive A, B, C…; others are unmatched.').pack(anchor='w',padx=6)
+        editor=tk.Text(dialog,height=6,wrap='none'); editor.pack(fill='x',padx=6,pady=5)
+        editor.insert('1.0','\n'.join(f'{name} | {pattern}' for name,pattern in self.scene_rules))
+        controls=ttk.Frame(dialog); controls.pack(fill='x',padx=6)
+        info=tk.StringVar(value=''); ttk.Label(dialog,textvariable=info).pack(anchor='w',padx=6)
+        tree=self.make_tree(dialog,[('image',310),('scene',100),('status',130),('rule hits',200)])
+        def parse():
+            result=[]
+            for line in editor.get('1.0','end-1c').splitlines():
+                if not line.strip():continue
+                if '|' not in line:raise ValueError('Each line needs: name | regex. Use an empty name for automatic naming.')
+                name,pattern=line.split('|',1); name=name.strip(); pattern=pattern.strip()
+                if not pattern:raise ValueError('Regex cannot be empty')
+                if name in ('All','(unmatched)'):raise ValueError('All and (unmatched) are reserved names')
+                re.compile(pattern); result.append((name,pattern))
+            return result
+        def preview(commit=False):
+            try:
+                rules=parse()
+                scratch={rel:{'groups':item['groups']} for rel,item in self.ds.images.items()}
+                assign_scenes(scratch,rules,self.vars['target'].get())
+                tree.delete(*tree.get_children()); counts=Counter(i['scene'] for i in scratch.values()); multi=0
+                for rel,item in sorted(scratch.items()):
+                    hits=item['scene_matches']; multi+=len(hits)>1
+                    state='unmatched' if item['scene']=='(unmatched)' else 'multiple' if len(hits)>1 else 'matched'
+                    tree.insert('','end',values=(rel,item['scene'],state,', '.join(f'{n}:{name}' for n,name in hits)))
+                info.set(' | '.join(f'{scene}: {count}' for scene,count in sorted(counts.items()))+f' | Multiple matches: {multi}')
+                if commit:self.scene_rules=rules; self.apply_scene_rules(); dialog.destroy()
+            except (ValueError,re.error) as e:messagebox.showerror('Invalid scene rules',str(e),parent=dialog)
+        ttk.Button(controls,text='Preview',command=preview).pack(side='left')
+        ttk.Button(controls,text='Apply',command=lambda:preview(True)).pack(side='left')
+        preview()
+
     def select_image(self,event=None):
         selected=self.image_tree.selection()
         if not selected:return
@@ -373,14 +459,14 @@ class App(tk.Tk):
         self.chart=tk.Toplevel(self); self.chart.title('Object size distribution'); self.chart.geometry('900x540')
         controls=ttk.Frame(self.chart,padding=6); controls.pack(fill='x')
         ttk.Label(controls,text='Diagonal bin edges (px, comma-separated)').pack(side='left'); ttk.Entry(controls,textvariable=self.vars['edges'],width=25).pack(side='left'); ttk.Button(controls,text='Apply bins',command=self.apply_edges).pack(side='left')
-        self.chart_note=ttk.Label(self.chart,text='Category, scene and split filters apply. Click a bar to filter the main list.'); self.chart_note.pack(anchor='w',padx=6)
+        self.chart_note=ttk.Label(self.chart,text='Counts include category objects in filtered images, including objects outside the selected bin. Click a bar to filter images.'); self.chart_note.pack(anchor='w',padx=6)
         self.chart_canvas=tk.Canvas(self.chart,bg='white'); self.chart_canvas.pack(fill='both',expand=True,padx=8,pady=8)
         self.chart_canvas.bind('<Configure>',lambda e:self.draw_chart()); self.chart_canvas.bind('<Button-1>',self.chart_click)
         self.draw_chart()
     def draw_chart(self):
         if not self.ds or not self.chart or not self.chart.winfo_exists():return
         c=self.chart_canvas; c.delete('all'); self.chart_bars=[]
-        objs=self.filtered(ignore_bin=True); labels=bin_labels(self.edges); counts=Counter(size_bin(o['diagonal'],self.edges) for o in objs)
+        objs=self.filtered(); labels=bin_labels(self.edges); counts=Counter(size_bin(o['diagonal'],self.edges) for o in objs)
         w=max(c.winfo_width(),300); h=max(c.winfo_height(),200); left=55; bottom=h-55; top=30; plotw=w-left-20; maxcount=max([counts[x] for x in labels]+[1]); step=plotw/len(labels)
         c.create_line(left,top,left,bottom,fill='#555'); c.create_line(left,bottom,w-20,bottom,fill='#555'); c.create_text(8,top,anchor='nw',text=str(maxcount))
         for n,label in enumerate(labels):
@@ -388,7 +474,7 @@ class App(tk.Tk):
             color='#225eaa' if self.vars['bin'].get()==label else '#4e9acb'; c.create_rectangle(x1,y,x2,bottom,fill=color,outline='')
             c.create_text((x1+x2)/2,max(top,y-14),text=str(counts[label])); c.create_text((x1+x2)/2,bottom+15,text=label)
             self.chart_bars.append((x1,x2,label))
-        c.create_text(w/2,h-8,text=f'BBox diagonal (px) • {len(objs):,} objects • {len({o["image"] for o in objs}):,} images',fill='#444')
+        c.create_text(w/2,h-8,text=f'BBox diagonal (px) • {len(objs):,} objects • {len(self.image_rows):,} selected images',fill='#444')
     def chart_click(self,event):
         for x1,x2,label in self.chart_bars:
             if x1<=event.x<=x2:self.vars['bin'].set(label); self.refresh(); return
@@ -396,7 +482,7 @@ class App(tk.Tk):
         p=filedialog.asksaveasfilename(defaultextension='.json',filetypes=[('JSON','*.json')])
         if p:
             settings={k:v.get() for k,v in self.vars.items()}; settings['edges']=','.join(f'{x:g}' for x in self.edges)
-            Path(p).write_text(json.dumps({'version':1,'settings':settings},indent=2,ensure_ascii=False),encoding='utf-8')
+            Path(p).write_text(json.dumps({'version':1,'settings':settings,'scene_rules':self.scene_rules},indent=2,ensure_ascii=False),encoding='utf-8')
     def open(self):
         p=filedialog.askopenfilename(filetypes=[('JSON','*.json')])
         if not p:return
@@ -405,19 +491,20 @@ class App(tk.Tk):
             if data.get('version')!=1:raise ValueError('Unsupported project version')
             for k,v in data['settings'].items():
                 if k in self.vars:self.vars[k].set(v)
-            self.edges=parse_edges(self.vars['edges'].get()); self.boxes['bin']['values']=['All',*bin_labels(self.edges),'8–<16 and height <4']; self.scan()
+            self.scene_rules=data.get('scene_rules',[]); self.edges=parse_edges(self.vars['edges'].get()); self.boxes['bin']['values']=['All',*bin_labels(self.edges),'8–<16 and height <4']; self.scan()
         except Exception as e:messagebox.showerror('Project error',str(e))
     def export(self):
         if not self.ds:messagebox.showinfo('Export','Scan a dataset first.'); return
         dialog=tk.Toplevel(self); dialog.title('Export report'); dialog.transient(self); dialog.grab_set()
-        ttk.Label(dialog,text='Export the current category, scene, split and bin filters.',padding=8).pack(anchor='w')
+        ttk.Label(dialog,text='Export selected images and category objects within them.',padding=8).pack(anchor='w')
         copy=tk.BooleanVar(value=False); ttk.Checkbutton(dialog,text='Copy selected original images into report folder',variable=copy).pack(anchor='w',padx=8)
         ttk.Label(dialog,text='Unchecked: HTML and CSV only; original images are not copied.',padding=8).pack(anchor='w')
         def go():
             folder=filedialog.askdirectory(parent=dialog)
             if not folder:return
-            try:export_report(self.ds,folder,self.vars['category'].get(),self.filtered(),self.edges,copy.get()); dialog.destroy(); messagebox.showinfo('Export',f'Report saved to {folder}')
+            try:export_report(self.ds,folder,self.vars['category'].get(),self.filtered(),self.edges,copy.get(),self.image_rows); dialog.destroy(); messagebox.showinfo('Export',f'Report saved to {folder}')
             except Exception as e:messagebox.showerror('Export failed',str(e),parent=dialog)
         ttk.Button(dialog,text='Choose output folder and export',command=go).pack(pady=8)
 
 if __name__=='__main__': App().mainloop()
+
