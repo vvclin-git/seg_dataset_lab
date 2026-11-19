@@ -91,3 +91,21 @@ class MatchModesTest(unittest.TestCase):
         self.assertEqual(match_details(item,'1',SPECIAL_BIN,[8,16,32],'Mode'),(True,1,2,True))
         self.assertFalse(match_details(item,'All',SPECIAL_BIN,[8,16,32],'Mode')[0])
         self.assertTrue(match_details(item,'1','All',[8,16,32],'All')[0])
+
+
+class PreviewTest(unittest.TestCase):
+    def test_coordinates_with_pan_and_zoom(self):
+        from seg_dataset_lab import preview_to_work
+        self.assertEqual(preview_to_work(150,150,(400,400),(200,200),(50,50),(100,100)),(0,0))
+        self.assertEqual(preview_to_work(249,249,(400,400),(200,200),(50,50),(100,100)),(49,49))
+        self.assertIsNone(preview_to_work(149,150,(400,400),(200,200),(50,50),(100,100)))
+    def test_click_prefers_smaller_mask_and_sort_numeric(self):
+        import numpy as np
+        from seg_dataset_lab import hit_mask, object_sort_key
+        big={'id':'1','category_id':1,'diagonal':100,'area':100}
+        small={'id':'2','category_id':1,'diagonal':9,'area':9}
+        m1=np.ones((4,4),dtype=bool); m2=np.zeros((4,4),dtype=bool); m2[1,1]=True
+        self.assertIs(hit_mask([big,small],{id(big):m1,id(small):m2},1,1),small)
+        self.assertIs(hit_mask([big,small],{id(big):m1,id(small):m2},2,2),big)
+        self.assertEqual(sorted([big,small],key=lambda o:object_sort_key(o,'size',{})),[small,big])
+        self.assertEqual(sorted([big,small],key=lambda o:object_sort_key(o,'area',{})),[small,big])
