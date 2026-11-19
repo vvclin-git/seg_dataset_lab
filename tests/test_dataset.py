@@ -39,3 +39,28 @@ class DatasetTest(unittest.TestCase):
         with self.assertRaises(ValueError):export_report(self.ds,self.root/'report',1,[obj])
 
 if __name__=='__main__':unittest.main()
+
+
+class FilteringSceneTest(unittest.TestCase):
+    def test_scene_matching_and_image_filter_scope(self):
+        from seg_dataset_lab import assign_scenes, filter_images, objects_in_images
+        from types import SimpleNamespace
+        def obj(category, diagonal):return {'category_id':category,'diagonal':diagonal,'height':2}
+        images={
+            'cam_a_1.png': {'groups':{'scene':'alpha'},'annotations':[obj(1,6),obj(1,24),obj(2,6)],'split':'train'},
+            'cam_b_2.png': {'groups':{'scene':'beta'},'annotations':[obj(1,24)],'split':'val'},
+            'other.png': {'groups':{},'annotations':[],'split':'unassigned'},
+        }
+        ds=SimpleNamespace(images=images)
+        assign_scenes(images,[('',r'^cam_a'),('Harbor',r'^cam_'),('B',r'^cam_b')])
+        self.assertEqual(images['cam_a_1.png']['scene'],'A')
+        self.assertEqual(images['cam_b_2.png']['scene'],'Harbor')
+        self.assertEqual(len(images['cam_b_2.png']['scene_matches']),2)
+        self.assertEqual(images['other.png']['scene'],'(unmatched)')
+        selected=filter_images(ds,'1','<8','All','All',[8,16,32])
+        self.assertEqual(selected,['cam_a_1.png'])
+        self.assertEqual([o['diagonal'] for o in objects_in_images(ds,selected,'1')],[6,24])
+        self.assertEqual(filter_images(ds,'All','All','All','All',[8,16,32]),list(images))
+        self.assertEqual(filter_images(ds,'1','<8','All','val',[8,16,32]),[])
+        assign_scenes(images,[])
+        self.assertEqual([images[x]['scene'] for x in images],['A','B','(unmatched)'])
