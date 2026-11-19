@@ -42,3 +42,10 @@ Select **Scenes** to enter one rule per line as `name | regex`. Separate the nam
 The **Mode** selector controls how Category and Bin select images. `Any` requires one matching object. `All` requires at least one selected-category object and every one must match the bin. `Mode` selects images when the chosen bin has the largest object count among bins; ties qualify and are marked `tie`. The comparison considers only the selected category. `Without category` selects annotated images with none of the chosen category; missing-GT images are excluded. Select category `All` to consider all annotated categories. With category and bin both `All`, `Any` shows all images, including missing GT; `All` and `Mode` require at least one annotation. `Without category` ignores the bin.
 
 The image-list `match` column shows matching/total selected-category objects (`—` when GT is missing). When the special `8–<16 and height <4` bin is used with Mode, matching objects form one bucket; other objects are counted in their ordinary diagonal bins, after removing the special-bin objects. Statistics remain all selected-category objects in filtered images, and the HTML report records the filter settings. Project files retain the match mode.
+
+
+## Preview and layout
+
+Drag either raised divider between the image list, GT list and preview to resize the panes. Click a GT column heading to sort ascending or descending; `size` sorts by numeric bbox diagonal and `area` by numeric working-grid mask area. The selected object remains selected when sorting.
+
+`GT overlay` toggles mask display. With `All masks` checked, all valid masks in the current image are shown in category colors; the selected object is highlighted in yellow. Uncheck `All masks` to display only the selected object's mask. Click a displayed mask to select its GT row. Where masks overlap, the smallest mask is selected first, which helps select a small object over a larger background. Bbox-only objects have no clickable mask; select those from the GT list. Drag the preview to pan and use the mouse wheel to zoom. Masks are cached only in memory for the current image.
