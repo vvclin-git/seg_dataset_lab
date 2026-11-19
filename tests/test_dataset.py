@@ -64,3 +64,30 @@ class FilteringSceneTest(unittest.TestCase):
         self.assertEqual(filter_images(ds,'1','<8','All','val',[8,16,32]),[])
         assign_scenes(images,[])
         self.assertEqual([images[x]['scene'] for x in images],['A','B','(unmatched)'])
+
+
+class MatchModesTest(unittest.TestCase):
+    def test_any_all_mode_tie_and_missing(self):
+        from seg_dataset_lab import match_details
+        obj=lambda size: {'category_id':1,'diagonal':size,'height':2}
+        item={'gt':True,'annotations':[obj(10),obj(11),obj(12),obj(50),obj(51)]}
+        edges=[8,16,32]
+        self.assertEqual(match_details(item,'1','8–<16',edges,'Any'),(True,3,5,False))
+        self.assertEqual(match_details(item,'1','8–<16',edges,'All'),(False,3,5,False))
+        self.assertEqual(match_details(item,'1','8–<16',edges,'Mode'),(True,3,5,False))
+        self.assertFalse(match_details(item,'1','≥32',edges,'Mode')[0])
+        item['annotations'].pop(2)
+        self.assertEqual(match_details(item,'1','8–<16',edges,'Mode'),(True,2,4,True))
+        self.assertEqual(match_details(item,'1','≥32',edges,'Mode'),(True,2,4,True))
+        item['annotations']=[]
+        for mode in ('Any','All','Mode'):
+            self.assertFalse(match_details(item,'1','<8',edges,mode)[0])
+        self.assertTrue(match_details(item,'1','<8',edges,'Without category')[0])
+        item['gt']=False
+        self.assertFalse(match_details(item,'1','<8',edges,'Without category')[0])
+    def test_special_bin_mode_and_all_category(self):
+        from seg_dataset_lab import match_details, SPECIAL_BIN
+        item={'gt':True,'annotations':[{'category_id':1,'diagonal':10,'height':2}, {'category_id':1,'diagonal':10,'height':5}, {'category_id':2,'diagonal':10,'height':5}]}
+        self.assertEqual(match_details(item,'1',SPECIAL_BIN,[8,16,32],'Mode'),(True,1,2,True))
+        self.assertFalse(match_details(item,'All',SPECIAL_BIN,[8,16,32],'Mode')[0])
+        self.assertTrue(match_details(item,'1','All',[8,16,32],'All')[0])
