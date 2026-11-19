@@ -181,18 +181,44 @@ def assign_scenes(images, rules, target='name'):
             item['scene_matches'] = []
 
 
-def filter_images(ds, category, bin_name, scene, split, edges):
+SPECIAL_BIN = '8–<16 and height <4'
+
+
+def object_matches_bin(obj, bin_name, edges):
+    if bin_name == 'All': return True
+    if bin_name == SPECIAL_BIN: return 8 <= obj['diagonal'] < 16 and obj['height'] < 4
+    return size_bin(obj['diagonal'], edges) == bin_name
+
+
+def match_details(item, category, bin_name, edges, mode='Any'):
+    objects = [o for o in item['annotations'] if category == 'All' or str(o['category_id']) == str(category)]
+    total = len(objects)
+    count = sum(object_matches_bin(o, bin_name, edges) for o in objects)
+    if mode == 'Without category':
+        return bool(item.get('gt')) and total == 0, count, total, False
+    if category == 'All' and bin_name == 'All' and mode == 'Any':
+        return True, count, total, False
+    if not total: return False, count, total, False
+    if mode == 'All': return count == total, count, total, False
+    if mode == 'Mode':
+        if bin_name == 'All': return True, count, total, False
+        buckets = Counter()
+        for obj in objects:
+            # Keep the special sub-bin disjoint from all ordinary bins.
+            label = SPECIAL_BIN if bin_name == SPECIAL_BIN and object_matches_bin(obj, SPECIAL_BIN, edges) else size_bin(obj['diagonal'], edges)
+            buckets[label] += 1
+        maximum = max(buckets.values())
+        return count > 0 and count == maximum, count, total, count > 0 and count == maximum and sum(v == maximum for v in buckets.values()) > 1
+    if mode == 'Any': return count > 0, count, total, False
+    raise ValueError(f'Unknown filter mode: {mode}')
+
+
+def filter_images(ds, category, bin_name, scene, split, edges, mode='Any'):
     selected = []
     for rel, item in ds.images.items():
         if scene != 'All' and item.get('scene', '(unmatched)') != scene: continue
         if split != 'All' and item['split'] != split: continue
-        if category == 'All' and bin_name == 'All':
-            selected.append(rel); continue
-        def matches(o):
-            if category != 'All' and str(o['category_id']) != str(category): return False
-            if bin_name == '8–<16 and height <4': return 8 <= o['diagonal'] < 16 and o['height'] < 4
-            return bin_name == 'All' or size_bin(o['diagonal'], edges) == bin_name
-        if any(matches(o) for o in item['annotations']): selected.append(rel)
+        if match_details(item, category, bin_name, edges, mode)[0]: selected.append(rel)
     return selected
 
 
@@ -201,7 +227,7 @@ def objects_in_images(ds, image_paths, category):
             if category == 'All' or str(o['category_id']) == str(category)]
 
 
-def export_report(ds, out, category, objects, edges=(8,16,32), copy_images=False, image_paths=None):
+def export_report(ds, out, category, objects, edges=(8,16,32), copy_images=False, image_paths=None, filter_context=None):
     image_paths = list({o['image'] for o in objects} if image_paths is None else image_paths)
     out = Path(out).resolve()
     if out == ds.root or ds.root in out.parents:
@@ -231,8 +257,9 @@ def export_report(ds, out, category, objects, edges=(8,16,32), copy_images=False
     rows=''.join(f'<tr><td>{esc(a)}</td><td>{esc(b)}</td><td>{len(v)}</td><td>{len({o["image"] for o in v})}</td></tr>' for (a,b),v in sorted(groups.items()))
     issues=''.join(f'<tr><td>{esc(a)}</td><td>{esc(b)}</td></tr>' for a,b in ds.issues)
     links=''.join(f'<li><a href="images/{quote(rel, safe="/")}">{esc(rel)}</a></li>' for rel in copied)
+    context_text = html.escape(json.dumps(filter_context or {}, ensure_ascii=False))
     image_text=f'Copied {len(copied)} selected images.<ul>{links}</ul>' if copy_images else 'No images copied. Object paths are relative to the original dataset root.'
-    (out/'report.html').write_text(f'''<!doctype html><meta charset="utf-8"><title>Dataset report</title><style>body{{font:15px sans-serif;margin:2em}}td,th{{border:1px solid #bbb;padding:.35em;text-align:left}}table{{border-collapse:collapse}}</style><h1>Segmentation dataset report</h1><p>Selected images: {len(image_paths)}; GT present: {gt}; target present: {len(has)}; annotated without target: {gt-len(has)}; missing GT: {len(image_paths)-gt}.</p><p>Category: {esc(category)}; selected objects: {len(objects)}; working grid: {ds.work[0]}×{ds.work[1]}, direct scaling; diagonal bin edges: {esc(edges)} px. Object and image denominators: {len(objects)}, {len(image_paths)}.</p><p>{image_text}</p><h2>Scene and size</h2><table><tr><th>Scene</th><th>Bin</th><th>Objects</th><th>Images</th></tr>{rows}</table><h2>Issues ({len(ds.issues)})</h2><table><tr><th>Type</th><th>Detail</th></tr>{issues}</table><p>Object IDs and complete measurements: objects.csv</p>''',encoding='utf-8')
+    (out/'report.html').write_text(f'''<!doctype html><meta charset="utf-8"><title>Dataset report</title><style>body{{font:15px sans-serif;margin:2em}}td,th{{border:1px solid #bbb;padding:.35em;text-align:left}}table{{border-collapse:collapse}}</style><h1>Segmentation dataset report</h1><p>Image filters: {context_text}</p><p>Selected images: {len(image_paths)}; GT present: {gt}; target present: {len(has)}; annotated without target: {gt-len(has)}; missing GT: {len(image_paths)-gt}.</p><p>Category: {esc(category)}; selected objects: {len(objects)}; working grid: {ds.work[0]}×{ds.work[1]}, direct scaling; diagonal bin edges: {esc(edges)} px. Object and image denominators: {len(objects)}, {len(image_paths)}.</p><p>{image_text}</p><h2>Scene and size</h2><table><tr><th>Scene</th><th>Bin</th><th>Objects</th><th>Images</th></tr>{rows}</table><h2>Issues ({len(ds.issues)})</h2><table><tr><th>Type</th><th>Detail</th></tr>{issues}</table><p>Object IDs and complete measurements: objects.csv</p>''',encoding='utf-8')
 
 class App(tk.Tk):
     def __init__(self):
@@ -243,7 +270,7 @@ class App(tk.Tk):
         self.zoom=1.; self.offset=[0,0]; self.drag=None; self.events=queue.Queue(); self.scanning=False
         self.edges=[8.,16.,32.]; self.chart=None; self.chart_bars=[]
         self.scene_rules=[]; self.sort_column='image'; self.sort_desc=False
-        self.vars={k:tk.StringVar(value=v) for k,v in {'root':'','gt':'','train':'','val':'','test':'','regex':r'^(?P<scene>.+?)_(?P<camera>camera\d+)_frame_(?P<frame>\d+)','target':'name','width':'960','height':'768','category':'1','bin':'All','scene':'All','split':'All','lookup':'','edges':'8,16,32'}.items()}
+        self.vars={k:tk.StringVar(value=v) for k,v in {'root':'','gt':'','train':'','val':'','test':'','regex':r'^(?P<scene>.+?)_(?P<camera>camera\d+)_frame_(?P<frame>\d+)','target':'name','width':'960','height':'768','category':'1','bin':'All','scene':'All','split':'All','lookup':'','edges':'8,16,32','mode':'Any'}.items()}
         top=ttk.Frame(self,padding=5); top.pack(fill='x')
         for r,(key,label,isdir) in enumerate([('root','Images folder',True),('gt','GT JSON / folder',False),('train','Train index',False),('val','Val index',False),('test','Test index',False)]):
             ttk.Label(top,text=label).grid(row=r,column=0,sticky='w'); ttk.Entry(top,textvariable=self.vars[key]).grid(row=r,column=1,sticky='ew'); ttk.Button(top,text='Browse',command=lambda k=key,d=isdir:self.choose(k,d)).grid(row=r,column=2)
@@ -256,16 +283,16 @@ class App(tk.Tk):
         self.scan_button=ttk.Button(rules,text='Scan',command=self.scan); self.scan_button.pack(side='left')
         for title,cmd in [('Save project',self.save),('Open project',self.open),('Scenes',self.scene_editor),('Statistics',self.show_chart),('Export report',self.export)]: ttk.Button(rules,text=title,command=cmd).pack(side='left')
         filters=ttk.Frame(self,padding=5); filters.pack(fill='x'); self.boxes={}
-        for k,vals in [('category',['All']),('bin',['All',*BINS,'8–<16 and height <4']),('scene',['All']),('split',['All','train','val','test','unassigned'])]:
+        for k,vals in [('category',['All']),('bin',['All',*BINS,'8–<16 and height <4']),('mode',['Any','All','Mode','Without category']),('scene',['All']),('split',['All','train','val','test','unassigned'])]:
             ttk.Label(filters,text=k.title()).pack(side='left'); c=ttk.Combobox(filters,textvariable=self.vars[k],values=vals,width=13,state='readonly'); c.pack(side='left'); c.bind('<<ComboboxSelected>>',lambda e:self.refresh()); self.boxes[k]=c
         ttk.Label(filters,text='Object ID').pack(side='left'); ttk.Entry(filters,textvariable=self.vars['lookup'],width=17).pack(side='left'); ttk.Button(filters,text='Find',command=self.find).pack(side='left')
         body=ttk.Panedwindow(self,orient='horizontal'); body.pack(fill='both',expand=True)
         left=ttk.Panedwindow(body,orient='horizontal'); right=ttk.Frame(body); body.add(left,weight=3); body.add(right,weight=3)
         images=ttk.Frame(left); objects=ttk.Frame(left); left.add(images,weight=1); left.add(objects,weight=1)
         ttk.Label(images,text='Images (select to view)',font=('TkDefaultFont',10,'bold')).pack(anchor='w')
-        self.image_tree=self.make_tree(images,[('image',200),('scene',75),('split',75),('GT',65)])
+        self.image_tree=self.make_tree(images,[('image',200),('scene',75),('split',75),('GT',65),('match',75)])
         self.image_tree.bind('<<TreeviewSelect>>',self.select_image)
-        for col in ('image','scene','split','GT'): self.image_tree.heading(col,command=lambda c=col:self.sort_images(c))
+        for col in ('image','scene','split','GT','match'): self.image_tree.heading(col,command=lambda c=col:self.sort_images(c))
         ttk.Label(objects,text='GT objects in selected image',font=('TkDefaultFont',10,'bold')).pack(anchor='w')
         self.object_tree=self.make_tree(objects,[('id',105),('class',65),('size',125),('area',60)])
         self.object_tree.bind('<<TreeviewSelect>>',self.select_object)
@@ -348,17 +375,20 @@ class App(tk.Tk):
 
     def refresh(self):
         if not self.ds:return
-        self.image_rows=filter_images(self.ds,self.vars['category'].get(),self.vars['bin'].get(),self.vars['scene'].get(),self.vars['split'].get(),self.edges)
+        self.image_rows=filter_images(self.ds,self.vars['category'].get(),self.vars['bin'].get(),self.vars['scene'].get(),self.vars['split'].get(),self.edges,self.vars['mode'].get())
         def sort_key(rel):
             item=self.ds.images[rel]
-            keys={'image':rel.casefold(),'scene':item['scene'].casefold(),'split':item['split'].casefold(),'GT':len(item['annotations']) if item['gt'] else -1}
+            details=match_details(item,self.vars['category'].get(),self.vars['bin'].get(),self.edges,self.vars['mode'].get())
+            keys={'image':rel.casefold(),'scene':item['scene'].casefold(),'split':item['split'].casefold(),'GT':len(item['annotations']) if item['gt'] else -1,'match':(details[1],details[2]) if item['gt'] else (-1,-1)}
             return keys[self.sort_column]
         self.image_rows.sort(key=sort_key,reverse=self.sort_desc)
         self.rows=self.filtered()
         self.image_tree.delete(*self.image_tree.get_children()); self.object_tree.delete(*self.object_tree.get_children()); self.object_rows=[]
         for n,rel in enumerate(self.image_rows):
             i=self.ds.images[rel]; state=f'{len(i["annotations"])} GT' if i['gt'] else 'missing'
-            self.image_tree.insert('','end',iid=str(n),values=(rel,i['scene'],i['split'],state))
+            _,matched,total,tied=match_details(i,self.vars['category'].get(),self.vars['bin'].get(),self.edges,self.vars['mode'].get())
+            match_text=f'{matched}/{total}'+(' tie' if tied else '') if i['gt'] else '—'
+            self.image_tree.insert('','end',iid=str(n),values=(rel,i['scene'],i['split'],state,match_text))
         if self.current_image in self.image_rows:
             n=self.image_rows.index(self.current_image); self.image_tree.selection_set(str(n)); self.image_tree.see(str(n)); self.populate_objects()
         else:self.current_image=None; self.current=None; self.canvas.delete('all')
@@ -489,6 +519,7 @@ class App(tk.Tk):
         try:
             data=json.loads(Path(p).read_text(encoding='utf-8'))
             if data.get('version')!=1:raise ValueError('Unsupported project version')
+            self.vars['mode'].set('Any')
             for k,v in data['settings'].items():
                 if k in self.vars:self.vars[k].set(v)
             self.scene_rules=data.get('scene_rules',[]); self.edges=parse_edges(self.vars['edges'].get()); self.boxes['bin']['values']=['All',*bin_labels(self.edges),'8–<16 and height <4']; self.scan()
@@ -502,9 +533,10 @@ class App(tk.Tk):
         def go():
             folder=filedialog.askdirectory(parent=dialog)
             if not folder:return
-            try:export_report(self.ds,folder,self.vars['category'].get(),self.filtered(),self.edges,copy.get(),self.image_rows); dialog.destroy(); messagebox.showinfo('Export',f'Report saved to {folder}')
+            try:export_report(self.ds,folder,self.vars['category'].get(),self.filtered(),self.edges,copy.get(),self.image_rows,{k:self.vars[k].get() for k in ('category','bin','mode','scene','split')}); dialog.destroy(); messagebox.showinfo('Export',f'Report saved to {folder}')
             except Exception as e:messagebox.showerror('Export failed',str(e),parent=dialog)
         ttk.Button(dialog,text='Choose output folder and export',command=go).pack(pady=8)
 
 if __name__=='__main__': App().mainloop()
+
 
